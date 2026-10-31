@@ -127,6 +127,8 @@ function prettyRatio(w, h) {
 
 // Desenha a fonte (frame da prévia ou VideoSample) no quadro de destino sem distorcer
 function compose(ctx, W, H, sw, sh, mode, draw, blurCanvas) {
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, W, H);
   if (mode === 'cover') {
@@ -308,9 +310,10 @@ function drawPreview(item, canvas) {
 }
 
 // ---------- conversão ----------
-function bitrateFor(f) {
-  const base = $('#quality').value === 'max' ? 12e6 : 8e6;
-  return Math.round(base * (f.w * f.h) / (1080 * 1920));
+// Taxa alta de propósito: 20 Mbps em 1080x1920 a 30 fps (a Meta recomprime; quanto melhor a entrada, melhor o anúncio)
+function bitrateFor(f, fps) {
+  const fpsFactor = fps > 31 ? 1.5 : 1;
+  return Math.round(20e6 * fpsFactor * (f.w * f.h) / (1080 * 1920));
 }
 
 // Decodifica o vídeo uma única vez e codifica todos os formatos escolhidos ao mesmo tempo
@@ -320,6 +323,9 @@ async function convert(item, keys, onProgress) {
   if (!vTrack || !(await vTrack.canDecode())) throw new Error('Formato de vídeo não suportado neste navegador');
   const aTrack = await input.getPrimaryAudioTrack();
   const duration = (await input.computeDuration()) || item.duration || 1;
+  const maxFps = Number($('#fps').value);
+  const srcFps = (await vTrack.computePacketStats(120)).averagePacketRate || 30;
+  const outFps = maxFps ? Math.min(maxFps, srcFps) : srcFps;
 
   let audioMode = null, audioConfig = null;
   if (aTrack) {
@@ -335,7 +341,7 @@ async function convert(item, keys, onProgress) {
     const f = FORMATS[key];
     const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'in-memory' }), target: new BufferTarget() });
     const video = new VideoSampleSource({
-      codec: 'avc', bitrate: bitrateFor(f), hardwareAcceleration: 'prefer-hardware',
+      codec: 'avc', bitrate: bitrateFor(f, outFps), hardwareAcceleration: 'prefer-hardware',
     });
     output.addVideoTrack(video);
     let audio = null;
@@ -352,7 +358,6 @@ async function convert(item, keys, onProgress) {
   });
   await Promise.all(targets.map((t) => t.output.start()));
 
-  const maxFps = Number($('#fps').value);
   const minGap = maxFps ? 1 / maxFps - 0.008 : 0;
 
   const videoJob = (async () => {
@@ -474,7 +479,6 @@ $('#allMode').addEventListener('change', (e) => {
     invalidate(item);
   }
 });
-$('#quality').addEventListener('change', () => items.forEach((i) => { if (i.state === 'done') invalidate(i); }));
 $('#clear').addEventListener('click', () => {
   if (busy()) return;
   for (const item of items) item.outputs.forEach((o) => URL.revokeObjectURL(o.url));
@@ -482,20 +486,54 @@ $('#clear').addEventListener('click', () => {
   grid.innerHTML = '';
   refresh();
 });
+let lastZipUrl = null;
 $('#zip').addEventListener('click', async () => {
   const files = items.flatMap((i) => i.outputs).map((o) => ({ name: o.name, blob: o.blob }));
   if (!files.length) return;
   const btn = $('#zip');
+  const name = 'videos-redimensionados.zip';
   btn.disabled = true;
   btn.textContent = 'Gerando zip…';
-  const zip = await makeZip(files);
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(zip);
-  a.download = 'videos-redimensionados.zip';
-  a.click();
-  setTimeout(() => URL.revokeObjectURL(a.href), 60000);
-  btn.textContent = 'Baixar tudo (.zip)';
-  refresh();
+  try {
+    if (window.showSaveFilePicker) {
+      // grava direto no disco: sem limite de memória e sem link temporário que expira
+      let handle;
+      try {
+        handle = await window.showSaveFilePicker({
+          suggestedName: name,
+          types: [{ description: 'Arquivo ZIP', accept: { 'application/zip': ['.zip'] } }],
+        });
+      } catch (err) {
+        if (err.name === 'AbortError') return;
+        throw err;
+      }
+      const writable = await handle.createWritable();
+      try {
+        await writeZip(files, (chunk) => writable.write(chunk), (p) => { btn.textContent = `Salvando zip… ${Math.round(p * 100)}%`; });
+        await writable.close();
+      } catch (err) {
+        await writable.abort().catch(() => {});
+        throw err;
+      }
+    } else {
+      const parts = [];
+      await writeZip(files, (chunk) => parts.push(chunk), (p) => { btn.textContent = `Gerando zip… ${Math.round(p * 100)}%`; });
+      if (lastZipUrl) URL.revokeObjectURL(lastZipUrl);
+      lastZipUrl = URL.createObjectURL(new Blob(parts, { type: 'application/zip' }));
+      const a = document.createElement('a');
+      a.href = lastZipUrl;
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    }
+  } catch (err) {
+    console.error(err);
+    alert('Não foi possível gerar o zip: ' + (err.message || err));
+  } finally {
+    btn.textContent = 'Baixar tudo (.zip)';
+    refresh();
+  }
 });
 
 function refresh() {
@@ -529,62 +567,104 @@ const CRC_TABLE = (() => {
   }
   return t;
 })();
-function crc32(buf) {
+async function crc32Blob(blob) {
   let c = 0xffffffff;
-  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  const reader = blob.stream().getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    for (let i = 0; i < value.length; i++) c = CRC_TABLE[(c ^ value[i]) & 0xff] ^ (c >>> 8);
+  }
   return (c ^ 0xffffffff) >>> 0;
 }
 
-async function makeZip(files) {
+// ZIP sem compressão (vídeo já é comprimido), com ZIP64 quando passar de 4 GB.
+// Os vídeos são escritos como Blob, sem copiar tudo para a memória.
+async function writeZip(files, write, onProgress) {
   const enc = new TextEncoder();
-  const parts = [], central = [];
+  const MAX32 = 0xffffffff;
+  const LIMIT = MAX32;
   const now = new Date();
   const time = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1);
   const date = ((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
-  let offset = 0;
+  const total = files.reduce((n, f) => n + f.blob.size, 0) || 1;
+  const central = [];
   const used = new Set();
+  let offset = 0, written = 0;
   for (const f of files) {
     let name = f.name, n = 1;
     while (used.has(name)) name = f.name.replace(/\.mp4$/, `_${++n}.mp4`);
     used.add(name);
     const nameBytes = enc.encode(name);
-    const data = new Uint8Array(await f.blob.arrayBuffer());
-    const crc = crc32(data);
+    const size = f.blob.size;
+    const crc = await crc32Blob(f.blob);
     const local = new DataView(new ArrayBuffer(30));
     local.setUint32(0, 0x04034b50, true);
     local.setUint16(4, 20, true);
     local.setUint16(6, 0x0800, true);
-    local.setUint16(8, 0, true);
     local.setUint16(10, time, true);
     local.setUint16(12, date, true);
     local.setUint32(14, crc, true);
-    local.setUint32(18, data.length, true);
-    local.setUint32(22, data.length, true);
+    local.setUint32(18, size, true);
+    local.setUint32(22, size, true);
     local.setUint16(26, nameBytes.length, true);
-    parts.push(local, nameBytes, data);
-    const cd = new DataView(new ArrayBuffer(46));
+    await write(new Uint8Array(local.buffer));
+    await write(nameBytes);
+    await write(f.blob);
+
+    const big = offset >= LIMIT;
+    const cd = new DataView(new ArrayBuffer(46 + nameBytes.length + (big ? 12 : 0)));
     cd.setUint32(0, 0x02014b50, true);
-    cd.setUint16(4, 20, true);
-    cd.setUint16(6, 20, true);
+    cd.setUint16(4, 45, true);
+    cd.setUint16(6, big ? 45 : 20, true);
     cd.setUint16(8, 0x0800, true);
     cd.setUint16(12, time, true);
     cd.setUint16(14, date, true);
     cd.setUint32(16, crc, true);
-    cd.setUint32(20, data.length, true);
-    cd.setUint32(24, data.length, true);
+    cd.setUint32(20, size, true);
+    cd.setUint32(24, size, true);
     cd.setUint16(28, nameBytes.length, true);
-    cd.setUint32(42, offset, true);
-    central.push(cd, nameBytes);
-    offset += 30 + nameBytes.length + data.length;
+    cd.setUint16(30, big ? 12 : 0, true);
+    cd.setUint32(42, big ? MAX32 : offset, true);
+    new Uint8Array(cd.buffer).set(nameBytes, 46);
+    if (big) {
+      cd.setUint16(46 + nameBytes.length, 0x0001, true);
+      cd.setUint16(48 + nameBytes.length, 8, true);
+      cd.setBigUint64(50 + nameBytes.length, BigInt(offset), true);
+    }
+    central.push(new Uint8Array(cd.buffer));
+    offset += 30 + nameBytes.length + size;
+    written += size;
+    onProgress?.(written / total);
   }
-  const cdSize = central.reduce((n, p) => n + p.byteLength, 0);
+
+  const cdOffset = offset;
+  const cdSize = central.reduce((n, p) => n + p.length, 0);
+  for (const c of central) await write(c);
+
+  const zip64 = cdOffset >= LIMIT || cdOffset + cdSize >= LIMIT || files.length >= 0xffff;
+  if (zip64) {
+    const rec = new DataView(new ArrayBuffer(56 + 20));
+    rec.setUint32(0, 0x06064b50, true);
+    rec.setBigUint64(4, 44n, true);
+    rec.setUint16(12, 45, true);
+    rec.setUint16(14, 45, true);
+    rec.setBigUint64(24, BigInt(files.length), true);
+    rec.setBigUint64(32, BigInt(files.length), true);
+    rec.setBigUint64(40, BigInt(cdSize), true);
+    rec.setBigUint64(48, BigInt(cdOffset), true);
+    rec.setUint32(56, 0x07064b50, true);
+    rec.setBigUint64(64, BigInt(cdOffset + cdSize), true);
+    rec.setUint32(72, 1, true);
+    await write(new Uint8Array(rec.buffer));
+  }
   const end = new DataView(new ArrayBuffer(22));
   end.setUint32(0, 0x06054b50, true);
-  end.setUint16(8, files.length, true);
-  end.setUint16(10, files.length, true);
-  end.setUint32(12, cdSize, true);
-  end.setUint32(16, offset, true);
-  return new Blob([...parts, ...central, end], { type: 'application/zip' });
+  end.setUint16(8, zip64 ? 0xffff : files.length, true);
+  end.setUint16(10, zip64 ? 0xffff : files.length, true);
+  end.setUint32(12, zip64 ? MAX32 : cdSize, true);
+  end.setUint32(16, zip64 ? MAX32 : cdOffset, true);
+  await write(new Uint8Array(end.buffer));
 }
 
 refresh();
