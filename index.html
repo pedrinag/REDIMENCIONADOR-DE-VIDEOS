@@ -76,6 +76,7 @@
   }
   .btn:hover:not(:disabled) { border-color: #3a4256; }
   .btn:disabled { opacity: .45; cursor: not-allowed; }
+  .btn.on { border-color: var(--ok); color: var(--ok); }
   .btn.primary { background: linear-gradient(135deg, var(--accent), var(--accent-2)); border: 0; }
   .btn.small { padding: 6px 10px; font-size: 12px; }
   .stats { color: var(--muted); font-size: 13px; }
@@ -187,6 +188,7 @@
     <div class="spacer"></div>
     <span class="stats" id="stats"></span>
     <button class="btn" id="clear">Limpar</button>
+    <button class="btn" id="folder" hidden title="Cada vídeo pronto é gravado direto nessa pasta, sem precisar baixar">📁 Salvar numa pasta</button>
     <button class="btn" id="zip" disabled>Baixar tudo (.zip)</button>
     <button class="btn primary" id="run" disabled>Converter tudo</button>
   </div>

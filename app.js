@@ -201,7 +201,6 @@ function renderCard(item) {
   el.querySelector('.remove').addEventListener('click', () => {
     if (item.state === 'working') return;
     items.splice(items.indexOf(item), 1);
-    item.outputs.forEach((o) => URL.revokeObjectURL(o.url));
     el.remove();
     refresh();
   });
@@ -287,9 +286,10 @@ function updateCard(item) {
   if (item.state === 'done') {
     for (const o of item.outputs) {
       const a = document.createElement('a');
-      a.href = o.url;
-      a.download = o.name;
-      a.textContent = `⬇ ${FORMATS[o.key].label} · ${fmtSize(o.blob.size)}`;
+      a.href = '#';
+      a.textContent = `⬇ ${FORMATS[o.key].label} · ${fmtSize(o.size)}`;
+      a.title = o.file ? `Salvo na pasta como ${o.name}` : o.name;
+      a.addEventListener('click', (e) => { e.preventDefault(); downloadOutput(o); });
       dl.appendChild(a);
     }
   }
@@ -400,7 +400,7 @@ async function convert(item, keys, onProgress) {
   await Promise.all(targets.map((t) => t.output.finalize()));
   return {
     audioDropped: !!aTrack && !audioMode,
-    results: targets.map((t) => ({ key: t.key, blob: new Blob([t.output.target.buffer], { type: 'video/mp4' }) })),
+    results: targets.map((t) => ({ key: t.key, data: new Uint8Array(t.output.target.buffer) })),
   };
 }
 
@@ -411,7 +411,6 @@ let active = 0;
 function enqueue(item) {
   if (!item.w || !item.formats.size) return;
   if (item.state === 'queued' || item.state === 'working') return;
-  item.outputs.forEach((o) => URL.revokeObjectURL(o.url));
   item.outputs = [];
   item.state = 'queued';
   item.status = 'Na fila…';
@@ -444,11 +443,15 @@ async function processItem(item) {
       if (el) el.querySelector('.bar > i').style.width = Math.round(p * 100) + '%';
     });
     const base = item.file.name.replace(/\.[^.]+$/, '');
-    item.outputs = results.map((r) => ({ ...r, name: `${base}_${r.key}.mp4`, url: URL.createObjectURL(r.blob) }));
+    // Fica como bytes na memória da página, não como Blob: o armazenamento de Blobs do Chrome
+    // estoura com lotes grandes e aí downloads/zip falham com "network error"
+    item.outputs = results.map((r) => ({ key: r.key, name: `${base}_${r.key}.mp4`, data: r.data, file: null, size: r.data.byteLength }));
     item.state = 'done';
     item.progress = 1;
     const secs = ((performance.now() - t0) / 1000).toFixed(1);
     item.status = audioDropped ? `Pronto em ${secs}s (áudio não pôde ser convertido neste navegador)` : `Pronto ✓ em ${secs}s`;
+    if (outDir) await saveOutputs(item);
+    if (outDir && item.outputs.every((o) => o.file)) item.status += ' · salvo na pasta';
   } catch (err) {
     console.error(err);
     item.state = 'error';
@@ -461,6 +464,57 @@ function runAll() {
   for (const item of items) if (item.state === 'ready' || item.state === 'error') enqueue(item);
 }
 const ORDER = Object.keys(FORMATS);
+
+// ---------- salvar ----------
+let outDir = null;
+
+function downloadOutput(o) {
+  const url = URL.createObjectURL(o.file || new Blob([o.data], { type: 'video/mp4' }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = o.name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5 * 60 * 1000);
+}
+
+// Grava no disco e troca os bytes da memória pelo arquivo salvo
+async function saveOutputs(item) {
+  for (const o of item.outputs) {
+    if (o.file) continue;
+    try {
+      const fh = await outDir.getFileHandle(o.name, { create: true });
+      const w = await fh.createWritable();
+      await w.write(o.data);
+      await w.close();
+      o.file = await fh.getFile();
+      o.data = null;
+    } catch (err) {
+      console.error(err);
+      item.status = 'Pronto, mas não consegui salvar na pasta: ' + (err.message || err);
+    }
+  }
+}
+
+if (window.showDirectoryPicker) {
+  $('#folder').hidden = false;
+  $('#folder').addEventListener('click', async () => {
+    try {
+      outDir = await window.showDirectoryPicker({ id: 'redimensionados', mode: 'readwrite' });
+    } catch (err) {
+      if (err.name !== 'AbortError') alert('Não foi possível usar essa pasta: ' + (err.message || err));
+      return;
+    }
+    $('#folder').textContent = `📁 Salvando em: ${outDir.name}`;
+    $('#folder').classList.add('on');
+    for (const item of items) {
+      if (item.state !== 'done') continue;
+      await saveOutputs(item);
+      updateCard(item);
+    }
+  });
+}
 
 // ---------- toolbar ----------
 $('#run').addEventListener('click', runAll);
@@ -481,14 +535,13 @@ $('#allMode').addEventListener('change', (e) => {
 });
 $('#clear').addEventListener('click', () => {
   if (busy()) return;
-  for (const item of items) item.outputs.forEach((o) => URL.revokeObjectURL(o.url));
   items.length = 0;
   grid.innerHTML = '';
   refresh();
 });
 let lastZipUrl = null;
 $('#zip').addEventListener('click', async () => {
-  const files = items.flatMap((i) => i.outputs).map((o) => ({ name: o.name, blob: o.blob }));
+  const files = items.flatMap((i) => i.outputs).map((o) => ({ name: o.name, src: o.file || o.data, size: o.size }));
   if (!files.length) return;
   const btn = $('#zip');
   const name = 'videos-redimensionados.zip';
@@ -567,13 +620,17 @@ const CRC_TABLE = (() => {
   }
   return t;
 })();
-async function crc32Blob(blob) {
+async function crc32Of(src) {
   let c = 0xffffffff;
-  const reader = blob.stream().getReader();
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    for (let i = 0; i < value.length; i++) c = CRC_TABLE[(c ^ value[i]) & 0xff] ^ (c >>> 8);
+  const update = (buf) => { for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8); };
+  if (src instanceof Uint8Array) update(src);
+  else {
+    const reader = src.stream().getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      update(value);
+    }
   }
   return (c ^ 0xffffffff) >>> 0;
 }
@@ -587,7 +644,7 @@ async function writeZip(files, write, onProgress) {
   const now = new Date();
   const time = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1);
   const date = ((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
-  const total = files.reduce((n, f) => n + f.blob.size, 0) || 1;
+  const total = files.reduce((n, f) => n + f.size, 0) || 1;
   const central = [];
   const used = new Set();
   let offset = 0, written = 0;
@@ -596,8 +653,8 @@ async function writeZip(files, write, onProgress) {
     while (used.has(name)) name = f.name.replace(/\.mp4$/, `_${++n}.mp4`);
     used.add(name);
     const nameBytes = enc.encode(name);
-    const size = f.blob.size;
-    const crc = await crc32Blob(f.blob);
+    const size = f.size;
+    const crc = await crc32Of(f.src);
     const local = new DataView(new ArrayBuffer(30));
     local.setUint32(0, 0x04034b50, true);
     local.setUint16(4, 20, true);
@@ -610,7 +667,7 @@ async function writeZip(files, write, onProgress) {
     local.setUint16(26, nameBytes.length, true);
     await write(new Uint8Array(local.buffer));
     await write(nameBytes);
-    await write(f.blob);
+    await write(f.src);
 
     const big = offset >= LIMIT;
     const cd = new DataView(new ArrayBuffer(46 + nameBytes.length + (big ? 12 : 0)));
